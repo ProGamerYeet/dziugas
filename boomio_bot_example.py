@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import sys
 import time
 from multiprocessing import Process, Queue
 from queue import Empty
@@ -262,7 +263,6 @@ def save_grid_debug_snapshot(page, worker_id: int, step: int) -> None:
             if (existing) existing.remove();
         }"""
     )
-    print(f"[debug] saved grid snapshot: {path}")
 
 
 def capture_game_frame(page) -> bytes:
@@ -588,8 +588,9 @@ def restart_round_with_space(page, timeout_ms: int = 30_000, interval_s: float =
     return False
 
 
-def login(page, email: str) -> None:
-    print("[login] waiting for email form")
+def login(page, email: str, status_cb=None) -> None:
+    if status_cb:
+        status_cb("login: waiting for email form")
 
     email_selector = fill_first(
         page,
@@ -603,12 +604,15 @@ def login(page, email: str) -> None:
         "email",
         timeout_ms=30_000,
     )
-    print(f"[login] filled email field ({email_selector})")
+    if status_cb:
+        status_cb(f"login: filled email ({email_selector})")
     ensure_privacy_consent(page, timeout_ms=10_000)
-    print("[login] privacy consent checked")
+    if status_cb:
+        status_cb("login: privacy consent checked")
 
     if click_toliau(page, timeout_ms=10_000):
-        print("[login] submitted with: TOLIAU")
+        if status_cb:
+            status_cb("login: submitted with TOLIAU")
     else:
         submit_selector = click_first(
             page,
@@ -624,7 +628,8 @@ def login(page, email: str) -> None:
         )
         if submit_selector is None:
             raise RuntimeError("Could not find login submit control (including TOLIAU)")
-        print(f"[login] submitted with: {submit_selector}")
+        if status_cb:
+            status_cb(f"login: submitted with {submit_selector}")
 
     try:
         page.wait_for_load_state("networkidle", timeout=10_000)
@@ -633,11 +638,13 @@ def login(page, email: str) -> None:
         pass
 
     if click_sutinku(page, timeout_ms=15_000):
-        print("[login] confirmed with: SUTINKU")
+        if status_cb:
+            status_cb("login: confirmed with SUTINKU")
     else:
         raise RuntimeError("Could not find post-login start control: SUTINKU")
 
-    print("[login] login step completed")
+    if status_cb:
+        status_cb("login: completed")
 
 
 def worker(
@@ -651,12 +658,15 @@ def worker(
     email: str,
     skip_login: bool,
 ) -> None:
+    def worker_status(message: str) -> None:
+        out_q.put({"worker_id": worker_id, "type": "worker_status", "message": message})
+
     with sync_playwright() as p:
         policy = PixelPolicyNet(weights_file=weights_file, verbose=False)
         browser_type = getattr(p, browser_name)
         browser = browser_type.launch(headless=headless, slow_mo=slow_mo_ms)
         page = browser.new_page()
-        print(f"[worker {worker_id}] started (browser={browser_name}, headless={headless}, steps={steps})")
+        worker_status(f"started browser={browser_name} headless={headless} steps={steps}")
 
         # Capture WebSocket frames; often this is best for precise state/reward.
         def on_websocket(ws):
@@ -674,9 +684,9 @@ def worker(
         page.on("websocket", on_websocket)
         page.goto(GAME_URL, wait_until="domcontentloaded")
         if skip_login:
-            print("[worker] skipping login (--skip-login)")
+            worker_status("skipping login (--skip-login)")
         else:
-            login(page, email)
+            login(page, email, status_cb=worker_status)
 
         # Play until game over by default; --steps > 0 can still cap run length.
         total_step = 0
@@ -689,7 +699,7 @@ def worker(
         saved_grid_debug = False
         pending_samples: list[dict[str, Any]] = []
 
-        print(f"[worker {worker_id}] round {round_index} started")
+        worker_status(f"round {round_index} started")
         while True:
             if total_step % 200 == 0:
                 policy.reload_if_updated()
@@ -718,7 +728,7 @@ def worker(
                 if saw_alive_this_round and round_elapsed >= 5 and lives_remaining == 0:
                     done = True
                 if lives_remaining != last_lives:
-                    print(f"[worker {worker_id}] lives remaining: {lives_remaining}/3")
+                    worker_status(f"lives={lives_remaining}/3 score={score if isinstance(score, int) else '?'}")
                     last_lives = lives_remaining
 
             pending_samples.append(
@@ -776,16 +786,14 @@ def worker(
                 score_text = str(score) if isinstance(score, int) else "unknown"
                 lives_text = f"{lives_remaining}/3" if isinstance(lives_remaining, int) else "unknown"
                 if steps > 0:
-                    print(
-                        f"[worker {worker_id}] step {total_step + 1}/{steps}, "
-                        f"score={score_text}, lives={lives_text}"
-                    )
+                    worker_status(f"step {total_step + 1}/{steps} score={score_text} lives={lives_text}")
                 else:
-                    print(f"[worker {worker_id}] step {total_step + 1}, score={score_text}, lives={lives_text}")
+                    worker_status(f"step {total_step + 1} score={score_text} lives={lives_text}")
 
             if not saved_grid_debug and (total_step + 1) == 20:
                 save_grid_debug_snapshot(page=page, worker_id=worker_id, step=total_step + 1)
                 saved_grid_debug = True
+                worker_status("saved grid debug snapshot at step 20")
 
             total_step += 1
             if done:
@@ -802,7 +810,7 @@ def worker(
                             "reward": float(sample["reward"]),
                         }
                     )
-                print(f"[worker {worker_id}] game over at step {total_step}")
+                worker_status(f"game over at step {total_step}, restarting soon")
                 out_q.put(
                     {
                         "worker_id": worker_id,
@@ -820,9 +828,9 @@ def worker(
                     last_score = None
                     round_max_score = 0
                     policy.reload_if_updated()
-                    print(f"[worker {worker_id}] restarted with Space, round {round_index} started")
+                    worker_status(f"restarted with Space, round {round_index} started")
                     continue
-                print("[worker] game over detected but failed to restart with Space")
+                worker_status("failed to restart with Space")
                 break
 
             if steps > 0 and total_step >= steps:
@@ -839,7 +847,7 @@ def worker(
                             "reward": float(sample["reward"]),
                         }
                     )
-                print(f"[worker {worker_id}] reached step limit ({steps}), stopping worker")
+                worker_status(f"reached step limit ({steps}), stopping")
                 break
 
         while pending_samples:
@@ -866,12 +874,29 @@ def trainer_loop(num_workers: int, out_q: Queue, learning_rate: float, weights_f
     """
     done_workers = 0
     transitions = 0
-    policy = PixelPolicyNet(weights_file=weights_file, verbose=True)
+    policy = PixelPolicyNet(weights_file=weights_file, verbose=False)
     train_updates = 0
     reward_ema = 0.0
     grad_norm_ema = 0.0
     max_abs_reward = 0.0
     best_round_score = 0
+    worker_statuses = {i: "starting..." for i in range(num_workers)}
+    trainer_status = "starting trainer..."
+
+    def render_status() -> None:
+        lines = [f"[trainer] {trainer_status}"] + [f"[worker {i}] {worker_statuses[i]}" for i in range(num_workers)]
+        if not hasattr(render_status, "_initialized"):
+            sys.stdout.write("\n".join(lines) + "\n")
+            setattr(render_status, "_initialized", True)
+        else:
+            sys.stdout.write(f"\x1b[{len(lines)}F")
+            for line in lines:
+                sys.stdout.write("\x1b[2K" + line + "\n")
+        sys.stdout.flush()
+
+    render_status()
+    trainer_status = f"loaded weights from {weights_file}"
+    render_status()
 
     while done_workers < num_workers:
         try:
@@ -882,7 +907,8 @@ def trainer_loop(num_workers: int, out_q: Queue, learning_rate: float, weights_f
         if item["type"] == "transition":
             transitions += 1
             if transitions % 50 == 0:
-                print(f"[trainer] transitions={transitions}")
+                trainer_status = f"transitions={transitions} updates={train_updates} best_round_score={best_round_score}"
+                render_status()
         elif item["type"] == "train_sample":
             x = np.asarray(item["x"], dtype=np.float32)
             h = np.asarray(item["h"], dtype=np.float32)
@@ -903,34 +929,42 @@ def trainer_loop(num_workers: int, out_q: Queue, learning_rate: float, weights_f
             if train_updates % 500 == 0:
                 policy.save()
             if train_updates % 200 == 0:
-                print(
-                    "[trainer][metrics] "
-                    f"updates={train_updates} reward_ema={reward_ema:.4f} "
-                    f"max_abs_reward={max_abs_reward:.2f} grad_norm_ema={grad_norm_ema:.4f} "
-                    f"weight_norm={metrics['weight_norm']:.4f} baseline={metrics['baseline']:.4f} "
-                    f"best_round_score={best_round_score}"
+                trainer_status = (
+                    f"updates={train_updates} reward_ema={reward_ema:.4f} max_abs_reward={max_abs_reward:.2f} "
+                    f"grad_norm_ema={grad_norm_ema:.4f} weight_norm={metrics['weight_norm']:.4f} "
+                    f"baseline={metrics['baseline']:.4f} best_round_score={best_round_score}"
                 )
+                render_status()
         elif item["type"] == "game_over":
             policy.save()
             round_score = int(item.get("round_max_score", 0))
             best_round_score = max(best_round_score, round_score)
-            print(
-                f"[trainer] saved weights on game over (updates={train_updates}, "
-                f"worker={item['worker_id']}, round={item.get('round_index')}, "
-                f"round_max_score={round_score}, best_round_score={best_round_score})"
+            trainer_status = (
+                f"saved on game over worker={item['worker_id']} round={item.get('round_index')} "
+                f"round_max_score={round_score} best_round_score={best_round_score} updates={train_updates}"
             )
+            render_status()
+        elif item["type"] == "worker_status":
+            wid = int(item["worker_id"])
+            if wid in worker_statuses:
+                worker_statuses[wid] = str(item.get("message", ""))
+                render_status()
         elif item["type"] == "ws_frame":
-            payload = item.get("payload")
-            if isinstance(payload, str) and len(payload) < 200:
-                print(f"[ws][worker {item['worker_id']}] {payload}")
+            continue
         elif item["type"] == "worker_done":
             done_workers += 1
-            print(f"[trainer] worker {item['worker_id']} finished ({done_workers}/{num_workers})")
+            wid = int(item["worker_id"])
+            if wid in worker_statuses:
+                worker_statuses[wid] = "done"
+            trainer_status = f"workers finished {done_workers}/{num_workers} updates={train_updates}"
+            render_status()
         else:
-            print(f"[trainer] unknown event: {json.dumps(item)[:200]}")
+            trainer_status = f"unknown event: {json.dumps(item)[:120]}"
+            render_status()
 
     policy.save()
-    print(f"[trainer] all workers done, total transitions={transitions}")
+    trainer_status = f"all workers done, total transitions={transitions}, total updates={train_updates}"
+    render_status()
 
 
 def parse_args() -> argparse.Namespace:
@@ -1014,12 +1048,6 @@ def main() -> None:
         )
         for i in range(args.workers)
     ]
-
-    run_mode = "until game over" if args.steps == 0 else f"{args.steps} steps"
-    print(
-        f"[main] starting {args.workers} worker(s), url={GAME_URL}, browser={args.browser}, "
-        f"headless={args.headless}, mode={run_mode}"
-    )
 
     for proc in workers:
         proc.start()
