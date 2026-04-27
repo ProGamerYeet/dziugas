@@ -658,8 +658,16 @@ def worker(
     email: str,
     skip_login: bool,
 ) -> None:
+    current_step_display = 0
+
     def worker_status(message: str) -> None:
-        out_q.put({"worker_id": worker_id, "type": "worker_status", "message": message})
+        out_q.put(
+            {
+                "worker_id": worker_id,
+                "type": "worker_status",
+                "message": f"step={current_step_display} {message}",
+            }
+        )
 
     with sync_playwright() as p:
         policy = PixelPolicyNet(weights_file=weights_file, verbose=False)
@@ -701,6 +709,7 @@ def worker(
 
         worker_status(f"round {round_index} started")
         while True:
+            current_step_display = total_step + 1
             if total_step % 200 == 0:
                 policy.reload_if_updated()
             state_before = read_state(page)
@@ -717,6 +726,9 @@ def worker(
             lives_remaining = state_after.get("livesRemaining")
             score_before = state_before.get("score")
             lives_before = state_before.get("livesRemaining")
+            score_delta_metric: int | None = None
+            if isinstance(score_before, int) and isinstance(score, int):
+                score_delta_metric = score - score_before
             round_elapsed = time.time() - round_started_at
             done = False
             if isinstance(score, int) and score != last_score:
@@ -728,7 +740,13 @@ def worker(
                 if saw_alive_this_round and round_elapsed >= 5 and lives_remaining == 0:
                     done = True
                 if lives_remaining != last_lives:
-                    worker_status(f"lives={lives_remaining}/3 score={score if isinstance(score, int) else '?'}")
+                    delta_text = (
+                        f"{score_delta_metric:+d}" if isinstance(score_delta_metric, int) else "?"
+                    )
+                    worker_status(
+                        f"lives={lives_remaining}/3 score={score if isinstance(score, int) else '?'} "
+                        f"delta={delta_text}"
+                    )
                     last_lives = lives_remaining
 
             pending_samples.append(
@@ -782,13 +800,16 @@ def worker(
                     "done": done,
                 }
             )
-            if (total_step + 1) % 25 == 0:
+            if (total_step + 1) % 5 == 0:
                 score_text = str(score) if isinstance(score, int) else "unknown"
                 lives_text = f"{lives_remaining}/3" if isinstance(lives_remaining, int) else "unknown"
+                delta_text = f"{score_delta_metric:+d}" if isinstance(score_delta_metric, int) else "unknown"
                 if steps > 0:
-                    worker_status(f"step {total_step + 1}/{steps} score={score_text} lives={lives_text}")
+                    worker_status(
+                        f"step {total_step + 1}/{steps} score={score_text} lives={lives_text} delta={delta_text}"
+                    )
                 else:
-                    worker_status(f"step {total_step + 1} score={score_text} lives={lives_text}")
+                    worker_status(f"step {total_step + 1} score={score_text} lives={lives_text} delta={delta_text}")
 
             if not saved_grid_debug and (total_step + 1) == 20:
                 save_grid_debug_snapshot(page=page, worker_id=worker_id, step=total_step + 1)
