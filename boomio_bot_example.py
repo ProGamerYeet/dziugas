@@ -14,7 +14,6 @@ import argparse
 import io
 import json
 import os
-import random
 import re
 import time
 from multiprocessing import Process, Queue
@@ -51,12 +50,13 @@ GRID_INPUT_DIM = GRID_COLS * GRID_ROWS * 3
 
 
 class PixelPolicyNet:
-    def __init__(self, weights_file: str):
+    def __init__(self, weights_file: str, verbose: bool = True):
         self.weights_file = weights_file
         self.hidden = 10
         self.outputs = len(ACTION_ORDER)
         self.baseline = 0.0
         self.steps = 0
+        self.verbose = verbose
         if os.path.exists(weights_file):
             data = np.load(weights_file)
             self.w1 = data["w1"].astype(np.float32)
@@ -65,14 +65,18 @@ class PixelPolicyNet:
             self.b2 = data["b2"].astype(np.float32)
             self.baseline = float(data["baseline"]) if "baseline" in data else 0.0
             self.steps = int(data["steps"]) if "steps" in data else 0
-            print(f"[policy] loaded weights from {weights_file}")
+            self._last_mtime = os.path.getmtime(weights_file)
+            if self.verbose:
+                print(f"[policy] loaded weights from {weights_file}")
         else:
             rng = np.random.default_rng(seed=worker_seed_from_time())
             self.w1 = (rng.standard_normal((GRID_INPUT_DIM, self.hidden)) * 0.02).astype(np.float32)
             self.b1 = np.zeros((self.hidden,), dtype=np.float32)
             self.w2 = (rng.standard_normal((self.hidden, self.outputs)) * 0.02).astype(np.float32)
             self.b2 = np.zeros((self.outputs,), dtype=np.float32)
-            print(f"[policy] initialized new weights ({weights_file})")
+            self._last_mtime = 0.0
+            if self.verbose:
+                print(f"[policy] initialized new weights ({weights_file})")
 
     def save(self) -> None:
         np.savez(
@@ -84,6 +88,23 @@ class PixelPolicyNet:
             baseline=np.array(self.baseline, dtype=np.float32),
             steps=np.array(self.steps, dtype=np.int64),
         )
+        self._last_mtime = os.path.getmtime(self.weights_file)
+
+    def reload_if_updated(self) -> bool:
+        if not os.path.exists(self.weights_file):
+            return False
+        mtime = os.path.getmtime(self.weights_file)
+        if mtime <= self._last_mtime:
+            return False
+        data = np.load(self.weights_file)
+        self.w1 = data["w1"].astype(np.float32)
+        self.b1 = data["b1"].astype(np.float32)
+        self.w2 = data["w2"].astype(np.float32)
+        self.b2 = data["b2"].astype(np.float32)
+        self.baseline = float(data["baseline"]) if "baseline" in data else self.baseline
+        self.steps = int(data["steps"]) if "steps" in data else self.steps
+        self._last_mtime = mtime
+        return True
 
     def _forward(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         h = np.tanh(x @ self.w1 + self.b1)
@@ -98,7 +119,9 @@ class PixelPolicyNet:
         action_idx = int(np.random.choice(self.outputs, p=probs))
         return action_idx, ACTION_ORDER[action_idx], probs, h
 
-    def train_step(self, x: np.ndarray, h: np.ndarray, probs: np.ndarray, action_idx: int, reward: float, lr: float) -> None:
+    def train_step(
+        self, x: np.ndarray, h: np.ndarray, probs: np.ndarray, action_idx: int, reward: float, lr: float
+    ) -> dict[str, float]:
         self.baseline = 0.99 * self.baseline + 0.01 * reward
         advantage = reward - self.baseline
 
@@ -118,6 +141,28 @@ class PixelPolicyNet:
         self.w1 -= lr * grad_w1
         self.b1 -= lr * grad_b1
         self.steps += 1
+        grad_norm = float(
+            np.sqrt(
+                np.sum(grad_w1 * grad_w1)
+                + np.sum(grad_b1 * grad_b1)
+                + np.sum(grad_w2 * grad_w2)
+                + np.sum(grad_b2 * grad_b2)
+            )
+        )
+        weight_norm = float(
+            np.sqrt(
+                np.sum(self.w1 * self.w1)
+                + np.sum(self.b1 * self.b1)
+                + np.sum(self.w2 * self.w2)
+                + np.sum(self.b2 * self.b2)
+            )
+        )
+        return {
+            "advantage": float(advantage),
+            "grad_norm": grad_norm,
+            "weight_norm": weight_norm,
+            "baseline": float(self.baseline),
+        }
 
 
 def worker_seed_from_time() -> int:
@@ -602,13 +647,12 @@ def worker(
     headless: bool,
     steps: int,
     slow_mo_ms: int,
-    learning_rate: float,
     weights_file: str,
     email: str,
     skip_login: bool,
 ) -> None:
     with sync_playwright() as p:
-        policy = PixelPolicyNet(weights_file=weights_file)
+        policy = PixelPolicyNet(weights_file=weights_file, verbose=False)
         browser_type = getattr(p, browser_name)
         browser = browser_type.launch(headless=headless, slow_mo=slow_mo_ms)
         page = browser.new_page()
@@ -639,25 +683,16 @@ def worker(
         round_index = 1
         last_lives: int | None = None
         last_score: int | None = None
+        round_max_score = 0
         round_started_at = time.time()
         saw_alive_this_round = False
         saved_grid_debug = False
         pending_samples: list[dict[str, Any]] = []
 
-        def train_pending_sample(sample: dict[str, Any]) -> None:
-            policy.train_step(
-                x=sample["x"],
-                h=sample["h"],
-                probs=sample["probs"],
-                action_idx=sample["action_idx"],
-                reward=float(sample["reward"]),
-                lr=learning_rate,
-            )
-            if policy.steps % 500 == 0:
-                policy.save()
-
         print(f"[worker {worker_id}] round {round_index} started")
         while True:
+            if total_step % 200 == 0:
+                policy.reload_if_updated()
             state_before = read_state(page)
             frame_png = capture_game_frame(page)
             x = extract_grid_rgb_features(frame_png)
@@ -676,6 +711,7 @@ def worker(
             done = False
             if isinstance(score, int) and score != last_score:
                 last_score = score
+                round_max_score = max(round_max_score, score)
             if isinstance(lives_remaining, int):
                 if lives_remaining > 0:
                     saw_alive_this_round = True
@@ -707,7 +743,18 @@ def worker(
 
             reward = float(pending_samples[-1]["reward"])
             if len(pending_samples) > 3:
-                train_pending_sample(pending_samples.pop(0))
+                sample = pending_samples.pop(0)
+                out_q.put(
+                    {
+                        "worker_id": worker_id,
+                        "type": "train_sample",
+                        "x": sample["x"].tolist(),
+                        "h": sample["h"].tolist(),
+                        "probs": sample["probs"].tolist(),
+                        "action_idx": int(sample["action_idx"]),
+                        "reward": float(sample["reward"]),
+                    }
+                )
 
             out_q.put(
                 {
@@ -743,9 +790,27 @@ def worker(
             total_step += 1
             if done:
                 while pending_samples:
-                    train_pending_sample(pending_samples.pop(0))
+                    sample = pending_samples.pop(0)
+                    out_q.put(
+                        {
+                            "worker_id": worker_id,
+                            "type": "train_sample",
+                            "x": sample["x"].tolist(),
+                            "h": sample["h"].tolist(),
+                            "probs": sample["probs"].tolist(),
+                            "action_idx": int(sample["action_idx"]),
+                            "reward": float(sample["reward"]),
+                        }
+                    )
                 print(f"[worker {worker_id}] game over at step {total_step}")
-                policy.save()
+                out_q.put(
+                    {
+                        "worker_id": worker_id,
+                        "type": "game_over",
+                        "round_index": round_index,
+                        "round_max_score": round_max_score,
+                    }
+                )
                 time.sleep(1.0)
                 if restart_round_with_space(page, timeout_ms=30_000, interval_s=0.5):
                     round_index += 1
@@ -753,6 +818,8 @@ def worker(
                     saw_alive_this_round = False
                     last_lives = None
                     last_score = None
+                    round_max_score = 0
+                    policy.reload_if_updated()
                     print(f"[worker {worker_id}] restarted with Space, round {round_index} started")
                     continue
                 print("[worker] game over detected but failed to restart with Space")
@@ -760,24 +827,51 @@ def worker(
 
             if steps > 0 and total_step >= steps:
                 while pending_samples:
-                    train_pending_sample(pending_samples.pop(0))
+                    sample = pending_samples.pop(0)
+                    out_q.put(
+                        {
+                            "worker_id": worker_id,
+                            "type": "train_sample",
+                            "x": sample["x"].tolist(),
+                            "h": sample["h"].tolist(),
+                            "probs": sample["probs"].tolist(),
+                            "action_idx": int(sample["action_idx"]),
+                            "reward": float(sample["reward"]),
+                        }
+                    )
                 print(f"[worker {worker_id}] reached step limit ({steps}), stopping worker")
                 break
 
         while pending_samples:
-            train_pending_sample(pending_samples.pop(0))
+            sample = pending_samples.pop(0)
+            out_q.put(
+                {
+                    "worker_id": worker_id,
+                    "type": "train_sample",
+                    "x": sample["x"].tolist(),
+                    "h": sample["h"].tolist(),
+                    "probs": sample["probs"].tolist(),
+                    "action_idx": int(sample["action_idx"]),
+                    "reward": float(sample["reward"]),
+                }
+            )
         out_q.put({"worker_id": worker_id, "type": "worker_done"})
-        policy.save()
         browser.close()
 
 
-def trainer_loop(num_workers: int, out_q: Queue) -> None:
+def trainer_loop(num_workers: int, out_q: Queue, learning_rate: float, weights_file: str) -> None:
     """
     Stub trainer loop.
     Replace with replay buffer + model update code.
     """
     done_workers = 0
     transitions = 0
+    policy = PixelPolicyNet(weights_file=weights_file, verbose=True)
+    train_updates = 0
+    reward_ema = 0.0
+    grad_norm_ema = 0.0
+    max_abs_reward = 0.0
+    best_round_score = 0
 
     while done_workers < num_workers:
         try:
@@ -789,6 +883,42 @@ def trainer_loop(num_workers: int, out_q: Queue) -> None:
             transitions += 1
             if transitions % 50 == 0:
                 print(f"[trainer] transitions={transitions}")
+        elif item["type"] == "train_sample":
+            x = np.asarray(item["x"], dtype=np.float32)
+            h = np.asarray(item["h"], dtype=np.float32)
+            probs = np.asarray(item["probs"], dtype=np.float32)
+            metrics = policy.train_step(
+                x=x,
+                h=h,
+                probs=probs,
+                action_idx=int(item["action_idx"]),
+                reward=float(item["reward"]),
+                lr=learning_rate,
+            )
+            reward = float(item["reward"])
+            reward_ema = 0.995 * reward_ema + 0.005 * reward
+            grad_norm_ema = 0.995 * grad_norm_ema + 0.005 * metrics["grad_norm"]
+            max_abs_reward = max(max_abs_reward, abs(reward))
+            train_updates += 1
+            if train_updates % 500 == 0:
+                policy.save()
+            if train_updates % 200 == 0:
+                print(
+                    "[trainer][metrics] "
+                    f"updates={train_updates} reward_ema={reward_ema:.4f} "
+                    f"max_abs_reward={max_abs_reward:.2f} grad_norm_ema={grad_norm_ema:.4f} "
+                    f"weight_norm={metrics['weight_norm']:.4f} baseline={metrics['baseline']:.4f} "
+                    f"best_round_score={best_round_score}"
+                )
+        elif item["type"] == "game_over":
+            policy.save()
+            round_score = int(item.get("round_max_score", 0))
+            best_round_score = max(best_round_score, round_score)
+            print(
+                f"[trainer] saved weights on game over (updates={train_updates}, "
+                f"worker={item['worker_id']}, round={item.get('round_index')}, "
+                f"round_max_score={round_score}, best_round_score={best_round_score})"
+            )
         elif item["type"] == "ws_frame":
             payload = item.get("payload")
             if isinstance(payload, str) and len(payload) < 200:
@@ -799,6 +929,7 @@ def trainer_loop(num_workers: int, out_q: Queue) -> None:
         else:
             print(f"[trainer] unknown event: {json.dumps(item)[:200]}")
 
+    policy.save()
     print(f"[trainer] all workers done, total transitions={transitions}")
 
 
@@ -863,6 +994,8 @@ def main() -> None:
         )
 
     out_q: Queue = Queue(maxsize=10_000)
+    if not os.path.exists(args.weights_file):
+        PixelPolicyNet(args.weights_file, verbose=False).save()
     workers = [
         Process(
             target=worker,
@@ -873,7 +1006,6 @@ def main() -> None:
                 args.headless,
                 args.steps,
                 args.slow_mo_ms,
-                args.learning_rate,
                 args.weights_file,
                 args.email,
                 args.skip_login,
@@ -892,7 +1024,7 @@ def main() -> None:
     for proc in workers:
         proc.start()
 
-    trainer_loop(args.workers, out_q)
+    trainer_loop(args.workers, out_q, args.learning_rate, args.weights_file)
 
     for proc in workers:
         proc.join(timeout=1)
